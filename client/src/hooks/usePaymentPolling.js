@@ -38,11 +38,19 @@ export function usePaymentPolling(paymentId, onResult) {
     };
 
     const timer = setInterval(async () => {
-      // If the last request is slow, skip this tick instead of sending a second one.
-      if (stopped || waiting) return;
-      waiting = true;
+      if (stopped) return;
+      // Every tick counts, even one we skip, so the 2-minute limit holds even if
+      // a request hangs.
       polls += 1;
       setPollCount(polls);
+      const isLastPoll = polls >= MAX_POLLS;
+
+      // If the last request is still on its way, don't send a second one this tick.
+      if (waiting) {
+        if (isLastPoll) finish({ status: 'timeout', message: TIMEOUT_MESSAGE });
+        return;
+      }
+      waiting = true;
 
       try {
         const payment = await pollPayment(paymentId);
@@ -61,15 +69,13 @@ export function usePaymentPolling(paymentId, onResult) {
           return;
         }
       } catch (error) {
-        // A network blip should not end the payment: count it and try again next tick.
+        // A network blip should not end the payment: try again on the next tick.
         console.warn(`Poll ${polls} failed: ${error.message}`);
       } finally {
         waiting = false;
       }
 
-      if (polls >= MAX_POLLS) {
-        finish({ status: 'timeout', message: TIMEOUT_MESSAGE });
-      }
+      if (isLastPoll) finish({ status: 'timeout', message: TIMEOUT_MESSAGE });
     }, POLL_INTERVAL_MS);
 
     // Cleanup: runs when the screen unmounts (Cancel, success, failure) or paymentId changes.

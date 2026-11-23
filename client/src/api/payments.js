@@ -5,7 +5,7 @@ async function request(url, options) {
   try {
     response = await fetch(url, options);
   } catch (error) {
-    if (error.name === 'AbortError') throw error; // we cancelled it on purpose
+    if (error.name === 'AbortError') throw error; // we cancelled it on purpose (component unmounted)
     throw new Error('Could not reach the server. Check your connection and try again.');
   }
 
@@ -35,7 +35,10 @@ export async function initiatePayment({ phoneNumber, amount }) {
 
 // Current status of one payment: { status, resultDesc, mpesaReceiptNumber, amount, phoneNumber, ... }
 export async function pollPayment(paymentId) {
-  const body = await request(`/api/payments/${encodeURIComponent(paymentId)}/poll`);
+  // Give up on one poll after 10 seconds, so a hung request can't block the next ones.
+  const body = await request(`/api/payments/${encodeURIComponent(paymentId)}/poll`, {
+    signal: AbortSignal.timeout(10000),
+  });
   return body.data;
 }
 

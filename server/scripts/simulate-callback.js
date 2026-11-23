@@ -6,7 +6,8 @@ require('dotenv').config({ quiet: true });
 const axios = require('axios');
 
 const [checkoutRequestId = 'ws_CO_TEST_001', outcome = 'success'] = process.argv.slice(2);
-const url = `http://localhost:${process.env.PORT || 3000}/api/mpesa/callback`;
+const baseUrl = `http://localhost:${process.env.PORT || 3000}`;
+const url = `${baseUrl}/api/mpesa/callback`;
 
 const results = {
   success: { ResultCode: 0, ResultDesc: 'The service request is processed successfully.' },
@@ -25,21 +26,43 @@ const stkCallback = {
   ...results[outcome],
 };
 
-// Only successful payments come with CallbackMetadata.
-if (outcome === 'success') {
-  stkCallback.CallbackMetadata = {
-    Item: [
-      { Name: 'Amount', Value: 100 },
-      { Name: 'MpesaReceiptNumber', Value: 'SHK4G7Y8DR' },
-      { Name: 'TransactionDate', Value: 20260504143055 },
-      { Name: 'PhoneNumber', Value: 254712345678 },
-    ],
-  };
+// A receipt number that looks like M-Pesa's: 10 capital letters and digits.
+const randomReceipt = () =>
+  Array.from({ length: 10 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ0123456789'[Math.floor(Math.random() * 34)]).join('');
+
+// YYYYMMDDHHmmss as a number, like Safaricom sends it.
+const now = new Date();
+const transactionDate = Number(
+  [now.getFullYear(), now.getMonth() + 1, now.getDate(), now.getHours(), now.getMinutes(), now.getSeconds()]
+    .map((part, i) => String(part).padStart(i === 0 ? 4 : 2, '0'))
+    .join(''),
+);
+
+async function main() {
+  // Only successful payments come with CallbackMetadata. Use the payment's real amount and
+  // phone (from the running server) so the receipt in the React app matches what was typed.
+  if (outcome === 'success') {
+    let payment = { amount: 100, phoneNumber: '254712345678' };
+    try {
+      payment = (await axios.get(`${baseUrl}/api/payments/${checkoutRequestId}`)).data.data;
+    } catch {
+      console.warn(`Payment ${checkoutRequestId} not found on the server, using KES 100 and 254712345678.`);
+    }
+    stkCallback.CallbackMetadata = {
+      Item: [
+        { Name: 'Amount', Value: payment.amount },
+        { Name: 'MpesaReceiptNumber', Value: randomReceipt() },
+        { Name: 'TransactionDate', Value: transactionDate },
+        { Name: 'PhoneNumber', Value: Number(payment.phoneNumber) },
+      ],
+    };
+  }
+
+  const response = await axios.post(url, { Body: { stkCallback } });
+  console.log(`${outcome} callback sent for ${checkoutRequestId} -> ${response.status}`, response.data);
 }
 
-axios
-  .post(url, { Body: { stkCallback } })
-  .then((response) => console.log(`${outcome} callback sent for ${checkoutRequestId} -> ${response.status}`, response.data))
+main()
   .catch((error) => {
     console.error(`Could not send callback to ${url}: ${error.message}. Is the server running?`);
     process.exitCode = 1;

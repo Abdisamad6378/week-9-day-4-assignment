@@ -22,11 +22,19 @@ const MAX_ACCOUNT_REFERENCE = 12;
 const MAX_TRANSACTION_DESC = 13;
 const STILL_PROCESSING = 'Payment is still being processed. Try again in a few seconds.';
 
+// Day 4 polling: the React app calls GET /api/payments/:id/poll every 3 seconds.
+// Normally the callback resolves the payment. If no callback has come (for example the
+// callback URL is not reachable from Safaricom), the poll route asks Daraja itself, but
+// not on every poll: Daraja rate-limits the query API.
+const DARAJA_CHECK_AFTER_MS = 15 * 1000; // give the callback 15 seconds first
+const DARAJA_CHECK_EVERY_MS = 10 * 1000; // then at most one Daraja query per 10 seconds per payment
+const lastDarajaCheck = new Map(); // checkoutRequestId -> time of the last query (ms)
+
 const badRequest = (res, error) => res.status(400).json({ success: false, error });
 
 app.get('/', (req, res) => {
   res.json({
-    message: 'Week 9 Day 3: M-Pesa callbacks',
+    message: 'Week 9 Day 4: Payment form API',
     endpoints: [
       'GET  /api/health',
       'POST /api/mpesa/stkpush',
@@ -34,6 +42,7 @@ app.get('/', (req, res) => {
       'POST /api/mpesa/query',
       'GET  /api/payments',
       'GET  /api/payments/:checkoutRequestId',
+      'GET  /api/payments/:id/poll',
     ],
   });
 });
@@ -171,6 +180,62 @@ app.post('/api/mpesa/query', async (req, res) => {
 app.get('/api/payments', async (req, res) => {
   const payments = await prisma.payment.findMany({ orderBy: { createdAt: 'desc' } });
   res.json({ success: true, count: payments.length, data: payments });
+});
+
+// What the poll route sends back: only what the payment screens need.
+function toPollResult(payment) {
+  return {
+    id: payment.id,
+    checkoutRequestId: payment.checkoutRequestId,
+    status: payment.status,
+    resultDesc: payment.resultDesc,
+    mpesaReceiptNumber: payment.mpesaReceiptNumber,
+    amount: payment.amount,
+    phoneNumber: payment.phoneNumber,
+    createdAt: payment.createdAt,
+  };
+}
+
+// Asks Daraja about a pending payment, if it is time to. Never throws: a failed
+// query just means "still pending", and the next poll can try again.
+async function checkWithDarajaIfDue(payment) {
+  const now = Date.now();
+  const age = now - new Date(payment.createdAt).getTime();
+  const last = lastDarajaCheck.get(payment.checkoutRequestId) || 0;
+  if (age < DARAJA_CHECK_AFTER_MS || now - last < DARAJA_CHECK_EVERY_MS) return payment;
+
+  lastDarajaCheck.set(payment.checkoutRequestId, now);
+  try {
+    const daraja = await querySTKPushStatus(payment.checkoutRequestId);
+    if (daraja.ResultCode === undefined || daraja.ResultCode === null) return payment;
+
+    const resultCode = Number(daraja.ResultCode);
+    const status = statusFromResultCode(resultCode);
+    await updateIfPending(payment.checkoutRequestId, { status, resultCode, resultDesc: daraja.ResultDesc });
+    console.log(`Poll: Daraja says ${payment.checkoutRequestId} is ${status}: ${daraja.ResultDesc}`);
+    return prisma.payment.findUnique({ where: { id: payment.id } });
+  } catch (error) {
+    console.warn(`Poll: Daraja query for ${payment.checkoutRequestId} failed: ${error.message}`);
+    return payment;
+  }
+}
+
+// Day 4: the payment screen polls this every 3 seconds until the status is not "pending".
+// :id is the paymentId returned by POST /api/mpesa/stkpush (a checkoutRequestId works too).
+app.get('/api/payments/:id/poll', async (req, res) => {
+  const { id } = req.params;
+  let payment = await prisma.payment.findFirst({
+    where: { OR: [{ id }, { checkoutRequestId: id }] },
+  });
+  if (!payment) return res.status(404).json({ success: false, error: 'Payment not found' });
+
+  if (payment.status === 'pending') {
+    payment = await checkWithDarajaIfDue(payment);
+  } else {
+    lastDarajaCheck.delete(payment.checkoutRequestId);
+  }
+
+  res.json({ success: true, data: toPollResult(payment) });
 });
 
 app.get('/api/payments/:checkoutRequestId', async (req, res) => {

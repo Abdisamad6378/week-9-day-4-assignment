@@ -374,3 +374,91 @@ describe('Task 3: POST /api/mpesa/query', () => {
     assert.equal(body.data.status, 'pending');
   });
 });
+
+// Day 4: the React payment screen polls this route every 3 seconds.
+describe('GET /api/payments/:id/poll', () => {
+  const get = async (path) => {
+    const response = await fetch(`${baseUrl}${path}`);
+    return { status: response.status, body: await response.json() };
+  };
+
+  test('unknown id -> 404', async () => {
+    const { status, body } = await get('/api/payments/does-not-exist/poll');
+    assert.equal(status, 404);
+    assert.equal(body.error, 'Payment not found');
+  });
+
+  test('new pending payment: answers "pending" without calling Daraja', async () => {
+    const id = newId();
+    const payment = await createPending(id);
+    const calls = fakeDaraja({ ResultCode: '0', ResultDesc: 'should not be used' });
+
+    const { status, body } = await get(`/api/payments/${payment.id}/poll`);
+
+    assert.equal(status, 200);
+    assert.equal(body.data.id, payment.id);
+    assert.equal(body.data.status, 'pending');
+    assert.equal(calls.length, 0);
+  });
+
+  test('after a success callback: completed with the receipt (paymentId or checkoutRequestId)', async () => {
+    const id = newId();
+    const payment = await createPending(id);
+    await processCallback(successBody(id, 'SHK4G7Y8DR'));
+
+    for (const key of [payment.id, id]) {
+      const { body } = await get(`/api/payments/${key}/poll`);
+      assert.equal(body.data.status, 'completed');
+      assert.equal(body.data.mpesaReceiptNumber, 'SHK4G7Y8DR');
+      assert.equal(body.data.amount, 100);
+      assert.equal(body.data.phoneNumber, '254712345678');
+    }
+  });
+
+  test('after a cancelled callback: cancelled with resultDesc for the failure screen', async () => {
+    const id = newId();
+    const payment = await createPending(id);
+    await processCallback(failureBody(id, 1032, 'Request cancelled by user.'));
+
+    const { body } = await get(`/api/payments/${payment.id}/poll`);
+    assert.equal(body.data.status, 'cancelled');
+    assert.equal(body.data.resultDesc, 'Request cancelled by user.');
+  });
+
+  test('pending for over 15 s with no callback: asks Daraja once, then waits 10 s before asking again', async () => {
+    const id = newId();
+    const payment = await prisma.payment.create({
+      data: {
+        checkoutRequestId: id,
+        phoneNumber: '254712345678',
+        amount: 100,
+        createdAt: new Date(Date.now() - 20 * 1000),
+      },
+    });
+    const calls = fakeDaraja(() => {
+      const error = new Error('Request failed with status code 500');
+      error.response = { status: 500, data: { errorMessage: 'The transaction is being processed' } };
+      throw error;
+    });
+
+    const first = await get(`/api/payments/${payment.id}/poll`);
+    const second = await get(`/api/payments/${payment.id}/poll`);
+
+    assert.equal(first.body.data.status, 'pending');
+    assert.equal(second.body.data.status, 'pending');
+    assert.equal(calls.filter((c) => c.url.includes('stkpushquery')).length, 1);
+  });
+
+  test('Daraja query result 1032 is saved and returned as cancelled', async () => {
+    const id = newId();
+    const payment = await prisma.payment.create({
+      data: { checkoutRequestId: id, phoneNumber: '254712345678', amount: 100, createdAt: new Date(Date.now() - 20 * 1000) },
+    });
+    fakeDaraja({ ResponseCode: '0', ResultCode: '1032', ResultDesc: 'Request cancelled by user' });
+
+    const { body } = await get(`/api/payments/${payment.id}/poll`);
+    assert.equal(body.data.status, 'cancelled');
+    assert.equal(body.data.resultDesc, 'Request cancelled by user');
+    assert.equal((await findPayment(id)).status, 'cancelled');
+  });
+});
